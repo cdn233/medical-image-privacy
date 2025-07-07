@@ -1,8 +1,9 @@
 import streamlit as st
 import numpy as np
-import tensorflow as tf
-from tensorflow.keras.layers import Input, Conv2D, MaxPooling2D, UpSampling2D
-from tensorflow.keras.models import Model
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torchvision import transforms
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives import padding
 from cryptography.hazmat.backends import default_backend
@@ -10,53 +11,66 @@ import os
 import base64
 import io
 from PIL import Image
+import time
 
-# Initialize session state variables
+# Initialize session state
 def init_session_state():
-    if 'encrypted_data' not in st.session_state:
-        st.session_state.encrypted_data = None
-    if 'iv' not in st.session_state:
-        st.session_state.iv = None
-    if 'key' not in st.session_state:
-        st.session_state.key = None
-    if 'latent_vector' not in st.session_state:
-        st.session_state.latent_vector = None
+    keys = ['encrypted_data', 'iv', 'key', 'latent_vector', 'original_img', 'device']
+    for key in keys:
+        if key not in st.session_state:
+            st.session_state[key] = None
+            
+    if st.session_state.device is None:
+        st.session_state.device = torch.device('cpu')
 
-# Build the autoencoder model
-def build_autoencoder():
-    input_img = Input(shape=(128, 128, 1))
-    
-    # Encoder
-    x = Conv2D(32, (3, 3), activation='relu', padding='same')(input_img)
-    x = MaxPooling2D((2, 2), padding='same')(x)
-    x = Conv2D(64, (3, 3), activation='relu', padding='same')(x)
-    x = MaxPooling2D((2, 2), padding='same')(x)
-    x = Conv2D(128, (3, 3), activation='relu', padding='same')(x)
-    encoded = MaxPooling2D((2, 2), padding='same')(x)
-    
-    # Latent space representation (16x16x128 = 32768D compressed to 512D)
-    latent = Conv2D(512, (1, 1), activation='relu')(encoded)
-    
-    # Decoder
-    x = Conv2D(128, (3, 3), activation='relu', padding='same')(latent)
-    x = UpSampling2D((2, 2))(x)
-    x = Conv2D(64, (3, 3), activation='relu', padding='same')(x)
-    x = UpSampling2D((2, 2))(x)
-    x = Conv2D(32, (3, 3), activation='relu', padding='same')(x)
-    x = UpSampling2D((2, 2))(x)
-    decoded = Conv2D(1, (3, 3), activation='sigmoid', padding='same')(x)
-    
-    autoencoder = Model(input_img, decoded)
-    encoder = Model(input_img, latent)
-    
-    # Create decoder
-    latent_input = Input(shape=(16, 16, 512))
-    dec = autoencoder.layers[-7](latent_input)
-    for layer in autoencoder.layers[-6:]:
-        dec = layer(dec)
-    decoder = Model(latent_input, dec)
-    
-    return encoder, decoder
+# PyTorch Autoencoder
+class ConvAutoencoder(nn.Module):
+    def __init__(self):
+        super(ConvAutoencoder, self).__init__()
+        
+        # Encoder
+        self.enc1 = nn.Conv2d(1, 32, 3, padding=1)
+        self.enc2 = nn.Conv2d(32, 64, 3, padding=1)
+        self.enc3 = nn.Conv2d(64, 128, 3, padding=1)
+        self.pool = nn.MaxPool2d(2, 2)
+        
+        # Latent space
+        self.latent = nn.Conv2d(128, 512, 1)
+        
+        # Decoder
+        self.dec1 = nn.Conv2d(512, 128, 3, padding=1)
+        self.dec2 = nn.Conv2d(128, 64, 3, padding=1)
+        self.dec3 = nn.Conv2d(64, 32, 3, padding=1)
+        self.dec4 = nn.Conv2d(32, 1, 3, padding=1)
+        self.upsample = nn.Upsample(scale_factor=2, mode='nearest')
+
+    def forward(self, x):
+        # Encoder
+        x = F.relu(self.enc1(x))
+        x = self.pool(x)
+        x = F.relu(self.enc2(x))
+        x = self.pool(x)
+        x = F.relu(self.enc3(x))
+        x = self.pool(x)
+        
+        # Latent space
+        x = F.relu(self.latent(x))
+        
+        # Decoder
+        x = F.relu(self.dec1(x))
+        x = self.upsample(x)
+        x = F.relu(self.dec2(x))
+        x = self.upsample(x)
+        x = F.relu(self.dec3(x))
+        x = self.upsample(x)
+        x = torch.sigmoid(self.dec4(x))
+        return x
+
+# Initialize model
+def init_model():
+    model = ConvAutoencoder()
+    model.eval()  # Set to inference mode
+    return model
 
 # Encrypt data using AES-GCM
 def encrypt_data(data, key, iv):
@@ -87,13 +101,15 @@ def decrypt_data(ciphertext, key, iv, tag):
     
     return data
 
-# Convert image to proper format
+# Convert image to tensor
 def process_image(uploaded_file):
-    img = Image.open(uploaded_file).convert('L')  # Convert to grayscale
-    img = img.resize((128, 128))
-    img_array = np.array(img) / 255.0
-    img_array = np.expand_dims(img_array, axis=(0, -1))
-    return img, img_array
+    img = Image.open(uploaded_file).convert('L')
+    transform = transforms.Compose([
+        transforms.Resize((128, 128)),
+        transforms.ToTensor()
+    ])
+    img_tensor = transform(img).unsqueeze(0)
+    return img, img_tensor
 
 # Main application
 def main():
@@ -104,14 +120,15 @@ def main():
     """)
     
     init_session_state()
-    encoder, decoder = build_autoencoder()
+    model = init_model()
     
     # Hospital A Section
     st.header("🏥 Hospital A: Upload & Encryption")
     uploaded_file = st.file_uploader("Upload patient X-ray (128x128 grayscale)", type=["png", "jpg", "jpeg"])
     
     if uploaded_file is not None:
-        original_img, img_array = process_image(uploaded_file)
+        original_img, img_tensor = process_image(uploaded_file)
+        st.session_state.original_img = original_img
         
         # Display original image
         st.subheader("1. Uploaded X-ray")
@@ -120,13 +137,16 @@ def main():
         # Compression
         if st.button("Compress and Encrypt"):
             with st.spinner("Compressing image..."):
-                latent_vector = encoder.predict(img_array)
-                st.session_state.latent_vector = latent_vector
+                # Use PyTorch for compression
+                latent_vector = model.encoder(img_tensor)
+                st.session_state.latent_vector = latent_vector.detach().numpy()
             
             st.subheader("2. Compression Results")
-            st.write(f"Original Size: {img_array.nbytes:,} bytes")
-            latent_bytes = latent_vector.tobytes()
-            st.write(f"Compressed Size: {len(latent_bytes):,} bytes (512D latent space)")
+            original_size = img_tensor.nelement() * img_tensor.element_size()
+            latent_bytes = st.session_state.latent_vector.tobytes()
+            latent_size = len(latent_bytes)
+            st.write(f"Original Size: {original_size:,} bytes")
+            st.write(f"Compressed Size: {latent_size:,} bytes (512D latent space)")
             
             # Generate crypto material
             key = os.urandom(32)  # AES-256
@@ -180,26 +200,55 @@ def main():
         
         # Convert bytes back to numpy array
         latent_vector = np.frombuffer(decrypted_data, dtype=np.float32)
-        latent_vector = latent_vector.reshape((1, 16, 16, 512))
+        latent_vector = latent_vector.reshape((1, 512, 16, 16))
+        latent_tensor = torch.from_numpy(latent_vector)
         
         # Reconstruction
         with st.spinner("Reconstructing image..."):
-            reconstructed = decoder.predict(latent_vector)
-            reconstructed_img = Image.fromarray((reconstructed[0, :, :, 0] * 255).astype(np.uint8))
+            with torch.no_grad():
+                reconstructed = model.decoder(latent_tensor)
+                reconstructed_img = transforms.ToPILImage()(reconstructed.squeeze(0))
         
         st.subheader("5. Reconstructed X-ray")
         col1, col2 = st.columns(2)
         with col1:
-            st.image(original_img, caption="Original Image", use_column_width=True)
+            st.image(st.session_state.original_img, caption="Original Image", use_column_width=True)
         with col2:
             st.image(reconstructed_img, caption="Reconstructed Image", use_column_width=True)
         
         # Calculate metrics
-        mse = np.mean((img_array - reconstructed) ** 2)
-        psnr = 20 * np.log10(1.0 / np.sqrt(mse))
+        original_array = np.array(st.session_state.original_img)
+        reconstructed_array = np.array(reconstructed_img)
+        mse = np.mean((original_array - reconstructed_array) ** 2)
+        psnr = 20 * np.log10(255.0 / np.sqrt(mse))
         
         st.metric("Reconstruction Quality", f"PSNR: {psnr:.2f} dB")
         st.success("✅ Medical image successfully reconstructed at Hospital B!")
+
+# Add encoder/decoder methods to the model class
+def encoder(self, x):
+    x = F.relu(self.enc1(x))
+    x = self.pool(x)
+    x = F.relu(self.enc2(x))
+    x = self.pool(x)
+    x = F.relu(self.enc3(x))
+    x = self.pool(x)
+    x = F.relu(self.latent(x))
+    return x
+
+def decoder(self, x):
+    x = F.relu(self.dec1(x))
+    x = self.upsample(x)
+    x = F.relu(self.dec2(x))
+    x = self.upsample(x)
+    x = F.relu(self.dec3(x))
+    x = self.upsample(x)
+    x = torch.sigmoid(self.dec4(x))
+    return x
+
+# Add methods to the model class
+ConvAutoencoder.encoder = encoder
+ConvAutoencoder.decoder = decoder
 
 if __name__ == "__main__":
     main()
